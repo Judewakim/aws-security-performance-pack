@@ -15,3 +15,6 @@ __pycache__/
 .env
 cdk.out/
 node_modules/
+node_modules/
+.aws-sam/
+*.csv
