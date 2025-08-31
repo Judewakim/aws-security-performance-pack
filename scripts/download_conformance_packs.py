@@ -46,7 +46,7 @@ def download_and_upload_conformance_packs():
     # Create bucket name (this should match your CDK stack)
     bucket_name = f"security-conformance-packs-{account_id}-{region}"
     
-    print(f"🪣 Creating S3 bucket: {bucket_name}")
+    print(f"🧺 Creating S3 bucket: {bucket_name}")
     
     # Create S3 bucket for conformance packs
     try:
