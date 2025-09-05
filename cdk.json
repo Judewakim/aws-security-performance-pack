@@ -1,5 +1,5 @@
 {
-  "app": "python app.py",
+  "app": "python product1_app.py",
   "watch": {
     "include": [
       "**"

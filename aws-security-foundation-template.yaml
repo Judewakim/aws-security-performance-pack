@@ -1,0 +1,474 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS Security Foundation Stack - GuardDuty, Security Hub, Config, CloudTrail, SNS Alerting"
+
+Parameters:
+  AlertEmails:
+    Type: String
+    Description: "Email address(es) for security alerts (comma-separated)"
+    ConstraintDescription: "Must be valid email address(es)"
+  
+  EnableAWSFoundational:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Enable AWS Foundational Security Best Practices conformance pack"
+  
+  EnableCISFoundations:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Enable CIS AWS Foundations Benchmark conformance pack"
+  
+  AlertSeverity:
+    Type: String
+    Default: "CRITICAL"
+    AllowedValues: ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+    Description: "Minimum severity level for SNS alerts"
+  
+  SubscribeSecurityHub:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Create Security Hub resource (set to false if already subscribed)"
+
+Conditions:
+  EnableConfigCondition: !Or
+    - !Equals [!Ref EnableAWSFoundational, "true"]
+    - !Equals [!Ref EnableCISFoundations, "true"]
+  
+  AWSFoundationalCondition: !Equals [!Ref EnableAWSFoundational, "true"]
+  CISFoundationsCondition: !Equals [!Ref EnableCISFoundations, "true"]
+  SecurityHubCondition: !Equals [!Ref SubscribeSecurityHub, "true"]
+
+Resources:
+  SecurityAlerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "AWS Security Foundation Alerts"
+      TopicName: !Sub "SecurityFoundation-Alerts-${AWS::AccountId}"
+  
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlerts
+      Protocol: "email"
+      Endpoint: !Ref AlertEmails
+
+  SecurityEventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "security-events-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: SecurityEventsLifecycle
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: 2555
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableConfigCondition
+    Properties:
+      BucketName: !Sub "security-config-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ConfigDataLifecycle
+            Status: Enabled
+            ExpirationInDays: 365
+
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "security-cloudtrail-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CloudTrailLifecycle
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+            ExpirationInDays: 2555
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: "s3:GetBucketAcl"
+            Resource: !Sub "arn:aws:s3:::security-cloudtrail-${AWS::AccountId}-${AWS::Region}"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/SecurityFoundation"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::security-cloudtrail-${AWS::AccountId}-${AWS::Region}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+                "AWS:SourceArn": !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/SecurityFoundation"
+
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+
+  FoundationalStandard:
+    Type: AWS::SecurityHub::Standard
+    Condition: SecurityHubCondition
+    Properties:
+      StandardsArn: !Sub "arn:aws:securityhub:${AWS::Region}:${AWS::AccountId}:standards/aws-foundational-security-best-practices/v/1.0.0"
+
+  SecurityTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: SecurityFoundation
+      S3BucketName: !Ref CloudTrailBucket
+      IsMultiRegionTrail: true
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Condition: EnableConfigCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
+      Policies:
+        - PolicyName: ConfigS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketAcl"
+                  - "s3:GetBucketLocation"
+                  - "s3:ListBucket"
+                Resource: !Sub "arn:aws:s3:::security-config-${AWS::AccountId}-${AWS::Region}"
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: !Sub "arn:aws:s3:::security-config-${AWS::AccountId}-${AWS::Region}/*"
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: EnableConfigCondition
+    Properties:
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: EnableConfigCondition
+    Properties:
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  AWSFoundationalPack:
+    Type: AWS::Config::ConformancePack
+    Condition: AWSFoundationalCondition
+    DependsOn: ConfigRecorder
+    Properties:
+      ConformancePackName: AWS-Foundational-Security-Best-Practices
+      TemplateS3Uri: !Sub "s3://${ConfigBucket}/conformance-packs/AWS-Foundational-Security-Best-Practices.yaml"
+      DeliveryS3Bucket: !Ref ConfigBucket
+
+  CISFoundationsPack:
+    Type: AWS::Config::ConformancePack
+    Condition: CISFoundationsCondition
+    DependsOn: ConfigRecorder
+    Properties:
+      ConformancePackName: CIS-AWS-Foundations-Benchmark
+      TemplateS3Uri: !Sub "s3://${ConfigBucket}/conformance-packs/CIS-AWS-Foundations-Benchmark-Level-1.yaml"
+      DeliveryS3Bucket: !Ref ConfigBucket
+
+  EventProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: S3WritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:PutObject"
+                Resource: !Sub "${SecurityEventsBucket.Arn}/*"
+
+  SecurityEventProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt EventProcessorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          EVENTS_BUCKET: !Ref SecurityEventsBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          import os
+          
+          s3 = boto3.client('s3')
+          events_bucket = os.environ['EVENTS_BUCKET']
+          
+          def handler(event, context):
+              try:
+                  source = event.get('source', 'unknown')
+                  now = datetime.utcnow()
+                  event_id = str(uuid.uuid4())[:8]
+                  
+                  if source == 'aws.guardduty':
+                      s3_key = f"guardduty/{now.year}/{now.month:02d}/{now.strftime('%Y-%m-%d')}-finding-{event_id}.json"
+                  elif source == 'aws.securityhub':
+                      s3_key = f"securityhub/{now.year}/{now.month:02d}/{now.strftime('%Y-%m-%d')}-finding-{event_id}.json"
+                  elif source == 'aws.config':
+                      s3_key = f"config/{now.year}/{now.month:02d}/{now.strftime('%Y-%m-%d')}-compliance-{event_id}.json"
+                  else:
+                      s3_key = f"other/{now.year}/{now.month:02d}/{now.strftime('%Y-%m-%d')}-event-{event_id}.json"
+                  
+                  enriched_event = {
+                      'ingestion_timestamp': now.isoformat(),
+                      'event_id': event_id,
+                      'source_service': source,
+                      'detail_type': event.get('detail-type', 'unknown'),
+                      'original_event': event
+                  }
+                  
+                  s3.put_object(
+                      Bucket=events_bucket,
+                      Key=s3_key,
+                      Body=json.dumps(enriched_event, indent=2),
+                      ContentType='application/json',
+                      ServerSideEncryption='AES256'
+                  )
+                  
+                  return {'statusCode': 200, 'body': f'Event stored: {s3_key}'}
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  AlertProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "sns:Publish"
+                Resource: !Ref SecurityAlerts
+
+  SecurityAlertProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt AlertProcessorRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlerts
+          ALERT_SEVERITY: !Ref AlertSeverity
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          sns = boto3.client('sns')
+          topic_arn = os.environ['SNS_TOPIC_ARN']
+          alert_severity = os.environ['ALERT_SEVERITY']
+          
+          SEVERITY_LEVELS = {'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}
+          
+          def handler(event, context):
+              try:
+                  detail = event.get('detail', {})
+                  findings = detail.get('findings', [])
+                  
+                  for finding in findings:
+                      severity_label = finding.get('Severity', {}).get('Label', 'UNKNOWN')
+                      
+                      if SEVERITY_LEVELS.get(severity_label, 0) >= SEVERITY_LEVELS.get(alert_severity, 4):
+                          title = finding.get('Title', 'Security Finding')
+                          description = finding.get('Description', 'No description available')
+                          resource_id = finding.get('Resources', [{}])[0].get('Id', 'Unknown resource')
+                          
+                          message = f"""SECURITY ALERT - {severity_label} SEVERITY
+          
+          Title: {title}
+          Resource: {resource_id}
+          Description: {description}
+          
+          Time: {finding.get('CreatedAt', 'Unknown')}
+          
+          Please review this finding in the AWS Security Hub console."""
+                          
+                          sns.publish(
+                              TopicArn=topic_arn,
+                              Subject=f"ALERT: {severity_label} Security Alert - {title}",
+                              Message=message
+                          )
+                  
+                  return {'statusCode': 200}
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  GuardDutyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: ["aws.guardduty"]
+        detail-type: ["GuardDuty Finding"]
+      Targets:
+        - Arn: !GetAtt SecurityEventProcessor.Arn
+          Id: GuardDutyTarget
+
+  SecurityHubRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: ["aws.securityhub"]
+        detail-type: ["Security Hub Findings - Imported"]
+      Targets:
+        - Arn: !GetAtt SecurityEventProcessor.Arn
+          Id: SecurityHubTarget
+        - Arn: !GetAtt SecurityAlertProcessor.Arn
+          Id: SecurityHubAlertTarget
+
+  ConfigRule:
+    Type: AWS::Events::Rule
+    Condition: EnableConfigCondition
+    Properties:
+      EventPattern:
+        source: ["aws.config"]
+        detail-type: ["Config Rules Compliance Change"]
+      Targets:
+        - Arn: !GetAtt SecurityEventProcessor.Arn
+          Id: ConfigTarget
+
+  GuardDutyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityEventProcessor
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyRule.Arn
+
+  SecurityHubLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityEventProcessor
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityHubRule.Arn
+
+  SecurityHubAlertLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityAlertProcessor
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityHubRule.Arn
+
+  ConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableConfigCondition
+    Properties:
+      FunctionName: !Ref SecurityEventProcessor
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConfigRule.Arn
+
+Outputs:
+  SecurityEventsBucketName:
+    Description: "S3 bucket containing centralized security events (SIEM-ready)"
+    Value: !Ref SecurityEventsBucket
+  
+  SecurityAlertsTopicArn:
+    Description: "SNS topic for security alerts"
+    Value: !Ref SecurityAlerts
+  
+  GuardDutyDetectorId:
+    Description: "GuardDuty detector ID"
+    Value: !Ref GuardDutyDetector
+  
+  CloudTrailBucketName:
+    Description: "CloudTrail audit logs bucket"
+    Value: !Ref CloudTrailBucket
